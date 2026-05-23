@@ -1,48 +1,24 @@
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 import random
-import os
 import json
-import warnings
-from urllib.parse import urlencode
 import time
 import uuid
-from dotenv import load_dotenv
 from pathlib import Path
 import uuid
 import gzip
 import base64
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from smart_decision.spiders.blinkit_spider.common import Common
 
 
-warnings.filterwarnings("ignore")
-env_path = Path(__file__).parent / ".env.Development"
-load_dotenv(env_path)
-from scrapers.blinkit_mobile.base import Base
-
-
-class Product(Base):
+class Product(Common):
     """
-    Class for Blinkit Scraper
-
-    Attributes:
-        url (str): url of the product page
-        driver (WebDriver): Selenium WebDriver instance
-        market_place_id (str): unique id of the market place
-        market_place (str): name of the market place
-        market_place_url (str): url of the market place
-        market_place_region (str): region of the market place
+    Class for Blinkit product page
     """
-
-    def __init__(self):
-        self.market_place = "Blinkit"
-        self.base_url = "https://api2.grofers.com"
-        self.keyword_page_api = "https://api2.grofers.com/v1/layout/search"
-
-    def __del__(self):
-        """Destructor of the scraper."""
-        self.logger.info("Blinkit x product Scrapper Exited")
+    def __init__(self, logger):
+        super().__init__(logger)
+        self.logger = logger
 
     def extract_data_from_zip_compressed(self, encoded_string):
         """Function to get JSON data from Gzip-compressed Base64 data"""
@@ -99,75 +75,19 @@ class Product(Base):
         locality=None,
     ):
         """
-        Function to get all the products of a brand
-
-        Args:
-            brand_url: url of the brand filter applied page
-            pincode: pincode of the place
-
-        Returns:
-            products_list: list of products
+        Function to get all the products details form a page
         """
         delay = random.uniform(1, 2)
-        cookies = self.get_domain_cookies()
-        # decoded_params = self.decode_collection_filters(url=brand_url)
         time.sleep(delay)
-
-        # params = {
-        #     'q': f'{decoded_params.get("collection_name", "").lower()}',
-        #     'search_type': 'type_to_search',
-        # }
-        # encoded_params = urlencode(params)
-        # full_url = f"{self.keyword_page_api}?{encoded_params}"
 
         full_url = f'https://api2.grofers.com/v1/layout/product/{product_id}'
 
-        headers = {
-            'Host': 'api2.grofers.com',
-            'Host_app': 'blinkit',
-            'Version_name': '17.61.1',
-            'App_client': 'consumer_android',
-            'App_version': '80170611',
-            'Version_code': '80170611',
-            'Qd_sdk_request': 'true',
-            'Auth_key': '45bff2b1437ff764d5e5b9b292f9771428e18fc40b7f3b7303d196ea84ab4341',
-            'Qd_sdk_version': '1',
-            'Rn_bundle_version': '1009002001',
-            'App_api_version': '29',
-            'X-App-Theme': 'default',
-            'X-App-Appearance': 'LIGHT',
-            'X-System-Appearance': 'LIGHT',
-            'X-Accessibility-Voice-Over-Enabled': '0',
-            'Accept': 'application/json',
-            'Screen_density': '1080px',
-            'Screen_density_num': '3.5',
-            'Cpu-Level': 'LOW',
-            'Memory-Level': 'LOW',
-            'Storage-Level': 'HIGH',
-            'Network-Level': 'HIGH',
-            'Battery-Level': 'AVERAGE',
-            'Is_accessibility_enabled': 'false',
-            'Lat': f'{lat}',
-            'Lon': f'{lon}',
-            'X-Zomato-Installed': 'false',
-            'X-Rider-Installed': 'false',
-            'X-Bistro-Installed': 'false',
-            'X-District-Installed': 'false',
-            'Entry_source': 'default',
-            'Session_uuid': f'{uuid.uuid4()}',
-            'Device_id': f'{uuid.uuid4().hex[:16]}',
-            'Content-Type': 'application/json; charset=UTF-8',
-            'User-Agent': 'com.grofers.customerapp/280170611 (Linux; U; Android 10; en; Pixel 3 XL; Build/QQ1D.200105.002; Cronet/142.0.7432.0)',
-            'Priority': 'u=1, i',
-        }
-
-        response_json, _ = self.get_response_and_cookies(
-            url=full_url,
-            cookies=cookies,
-            headers=headers,
-            json_data={},
+        response_json = self.get_response(
+            request_url=full_url,
+            headers=self.get_headers(latitude=lat, longitude=lon),
+            method="POST",
+            data={},
         )
-        response_json = response_json.json()
 
         product_details = []
         info_details = []
@@ -179,13 +99,13 @@ class Product(Base):
             if snippets:
                 product_details.extend(snippets)
 
-            # FIXED: Must use .items()
-            for key, value in additional_details.items():
-                snippets_to_add = value.get("payload", {}).get("snippets_to_add", [])
-                for snippet in snippets_to_add:
-                    if snippet.get("widget_type", "") == "cart_bill_item":
-                        data = snippet.get("data", {})
-                        info_details.append(data)
+            if additional_details:
+                for key, value in additional_details.items():
+                    snippets_to_add = value.get("payload", {}).get("snippets_to_add", [])
+                    for snippet in snippets_to_add:
+                        if snippet.get("widget_type", "") == "cart_bill_item":
+                            data = snippet.get("data", {})
+                            info_details.append(data)
 
         except TypeError:
             return None
@@ -222,5 +142,5 @@ class Product(Base):
         all_sku_inventory.append(temp)
         self.logger.info(f"Scraped for {locality}: {product_id}")
 
-        return (all_sku_inventory, [])
+        return all_sku_inventory
 

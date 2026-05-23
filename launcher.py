@@ -7,7 +7,7 @@ from smart_decision.spiders.blinkit_spider.keyword_page_spider import BlinkitSpi
 
 def setup_logger(logfile: str = None):
     """Setup logger with file and console handlers"""
-    logger = logging.getLogger(f"{logfile.split("_")[0].capitalize()}Launcher")
+    logger = logging.getLogger(f"{logfile.split('_')[0].capitalize()}Launcher")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     logger.handlers.clear()  # Clear any existing handlers
