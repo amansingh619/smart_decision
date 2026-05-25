@@ -1,9 +1,13 @@
+import logging
 import sys
 from pathlib import Path
+
 import pandas as pd
-import logging
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from smart_decision.spiders.blinkit_spider.keyword_page_spider import BlinkitSpider 
+from smart_decision.spiders.blinkit_spider.keyword_page_spider import \
+    BlinkitSpider
+
 
 def setup_logger(logfile: str = None):
     """Setup logger with file and console handlers"""

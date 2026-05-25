@@ -1,13 +1,12 @@
-import random
+import base64
+import gzip
 import json
+import random
+import sys
 import time
 import uuid
 from pathlib import Path
-import uuid
-import gzip
-import base64
-import sys
-from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from smart_decision.spiders.blinkit_spider.common import Common
 
@@ -119,18 +118,16 @@ class Product(Common):
                     common_attribute = product.get("tracking", {}).get("common_attributes", {})
 
                     temp = {
-                        "locality": locality,
                         "product_name": product.get("data", {}).get("title", {}).get("text", ""),
                         "product_id": common_attribute.get("product_id", ""),
                         "mrp": common_attribute.get("mrp", ""),
                         "price": common_attribute.get("price", ""),
-                        "product_type": common_attribute.get("ptype", ""),
-                        "merchant_id": common_attribute.get("merchant_id", ""),
+                        "type": common_attribute.get("ptype", ""),
                     }
+                    temp["discount"] = round(int((temp["mrp"]- temp["price"])/temp["mrp"]*100)) if temp["mrp"] else ""
 
                 elif product.get("widget_type", "") == "crystal_snippet_type_6":
                     temp["brand_name"] = product.get("data", {}).get("title", {}).get("text", "")
-                    temp["brand_url"] = product.get("data", {}).get("click_action", {}).get("blinkit_deeplink", {}).get("url")
 
             for details in info_details:
                 text = details.get("left_header", {}).get("text", "")

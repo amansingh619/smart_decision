@@ -1,9 +1,9 @@
 """
 Scraper for Blinkit
 """
+import datetime
 import sys
 from pathlib import Path
-import datetime
 from urllib.parse import urlencode
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -130,12 +130,11 @@ class BlinkitSpider(Common):
                         else 0
                     ),
                     "mrp": product_common_attributes.get("mrp", ""),
-                    "selling_price": product_common_attributes.get("price", ""),
-                    "discount": "",
-                    "unit": pack_size,
-                    "category": product_common_attributes.get("l2_category", ""),
+                    "price": product_common_attributes.get("price", ""),
+                    "Unit": pack_size,
                     "type": product_common_attributes.get("ptype", ""),
                 }
+                temp["discount"] = round(int((temp["mrp"]- temp["price"])/temp["mrp"]*100)) if temp["mrp"] else ""
 
                 # extending product-page details 
                 product_id = temp["product_id"]

@@ -1,7 +1,9 @@
 import os
-import time
 import random
+import time
+
 from curl_cffi import requests as curl_requests
+
 
 class Common():
     def __init__(self, logger=None):
