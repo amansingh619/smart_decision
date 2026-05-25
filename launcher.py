@@ -1,20 +1,20 @@
-import logging
+# launcher.py
+
 import sys
 from pathlib import Path
-
 import pandas as pd
-
+import logging
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from smart_decision.spiders.blinkit_spider.keyword_page_spider import \
-    BlinkitSpider
 
+from spiders.blinkit_spider.keyword_page_spider import BlinkitSpider
+from smart_decision.pipeline import RecommendationPipeline
 
 def setup_logger(logfile: str = None):
     """Setup logger with file and console handlers"""
-    logger = logging.getLogger(f"{logfile.split('_')[0].capitalize()}Launcher")
+    logger = logging.getLogger("AgentPipeline")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
-    logger.handlers.clear()  # Clear any existing handlers
+    logger.handlers.clear()
 
     # File handler
     if logfile:
@@ -28,18 +28,41 @@ def setup_logger(logfile: str = None):
 
     # Console handler
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.INFO)
     console_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
 
     return logger
 
-data = BlinkitSpider(logger=setup_logger("launcher.log")).fetch_search_products(
-    keyword="sugar free ice cream",
-    pincode=302006,
-    latitude='26.9059311',
-    longitude='75.78443829999999' 
-)
-data_df = pd.DataFrame(data)
-data_df.to_excel('output.xlsx')
+
+if __name__ == "__main__":
+    logger = setup_logger("pipeline.log")
+    
+    # spider instance 
+    spider = BlinkitSpider(logger=logger)
+    
+    # creating pipeline for inst
+    pipeline = RecommendationPipeline(spider_instance=spider, logger=logger)
+    
+    # queries
+    queries = [
+        "Best sugar free vanilla ice cream under 200",
+        # "Low calorie ice cream for weight loss",
+        # "Compare Mother Dairy and Cream Bell sugar free ice cream",
+        # "High protein ice cream under 150"
+    ]
+    
+    for query in queries:
+        print(f"\n\n{'#'*60}")
+        print(f"# QUERY: {query}")
+        print(f"{'#'*60}")
+        
+        result = pipeline.launch_job(query)
+        
+        # Save results
+        products_data = [rp.product.dict() for rp in result.ranked_products]
+        df = pd.DataFrame(products_data)
+        safe_query = query.replace(" ", "_")[:50]
+        df.to_excel(f"results_{safe_query}.xlsx", index=False)
+        print(f"\nResults saved to results_{safe_query}.xlsx")
