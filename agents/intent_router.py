@@ -3,9 +3,8 @@ import json
 import os
 import re
 import time
+from huggingface_hub import InferenceClient
 
-from openai import OpenAI
-from openai import APIError, RateLimitError, APITimeoutError
 from schemas.intent import (DietaryConstraint, IntentEntities, IntentOutput,
                             QueryIntent)
 
@@ -18,11 +17,10 @@ class IntentRouter:
     
     def __init__(self, logger):
         self.logger = logger
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = "gpt-4o-mini"  
-        self.MAX_TOKEN_LIMIT=500
-        self.LLM_TEMPERATURE=0.1
-        self.LLM_OUTPUT_FORMAT={"type": "json_object"}
+        self.model = os.getenv("HF_MODEL")
+        self.client = InferenceClient(
+            api_key=os.getenv("HF_TOKEN")
+        )
         
     def classify_intent(self, query: str) -> IntentOutput:
         """query string → IntentOutput"""
@@ -40,7 +38,7 @@ class IntentRouter:
         base_delay: int = 2
     ) -> IntentOutput:
         """
-        Using ChatGPT for intent classification
+        Using Open source- hugging face for intent classification
         with retry + validation handling
         """
 
@@ -53,67 +51,57 @@ class IntentRouter:
                     f"{attempt}/{max_retries}"
                 )
 
+                messages = [
+                    {
+                        "role": "system",
+                        "content": self.get_system_prompt()
+                    },
+                    {
+                        "role": "user",
+                        "content": f'User Query: "{query}"'
+                    }
+                ]
+
                 response = self.client.chat.completions.create(
                     model=self.model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": self.get_system_prompt()
-                        },
-                        {
-                            "role": "user",
-                            "content": f'User Query: "{query}"'
-                        }
-                    ],
-                    response_format=self.LLM_OUTPUT_FORMAT,
-                    temperature=self.LLM_TEMPERATURE,
-                    max_tokens=self.MAX_TOKEN_LIMIT
+                    messages=messages,
                 )
 
-               
                 content = response.choices[0].message.content
-
                 if not content:
-                    raise ValueError("Empty response from LLM")
-                
-                raw = json.loads(content)
-                parsed_output = self.parse_llm_output(raw)
+                    raise ValueError("Empty response from model")
+
+                parsed_json = json.loads(content)
 
                 self.logger.info(
                     "LLM intent classification successful"
                 )
-                return parsed_output
-
-            except json.JSONDecodeError as e:
-
-                self.logger.warning(
-                    f"Invalid JSON response from LLM "
-                    f"(attempt {attempt}): {e}"
-                )
-
-            except (
-                RateLimitError,
-                APITimeoutError,
-                APIError
-            ) as e:
-
-                self.logger.warning(
-                    f"OpenAI API error"
-                    f"(attempt {attempt}): {e}"
-                )
+                return parsed_json
 
             except Exception as e:
+
                 self.logger.warning(
-                    f"Unexpected error during LLM classification "
+                    f"LLM classification error "
                     f"(attempt {attempt}): {e}"
                 )
 
-            if attempt < max_retries:
-                sleep_time = base_delay * (2 ** (attempt - 1))
-                self.logger.info(
-                    f"Retrying in {sleep_time:.1f} seconds..."
-                )
-                time.sleep(sleep_time)
+                if attempt < max_retries:
+
+                    sleep_time = (
+                        base_delay * (2 ** (attempt - 1))
+                    )
+
+                    self.logger.info(
+                        f"Retrying in {sleep_time:.1f} seconds..."
+                    )
+
+                    time.sleep(sleep_time)
+
+        self.logger.warning(
+            "Falling back to rule-based classification"
+        )
+
+        return self.rule_based_classify(query)
 
     
     def parse_llm_output(self, raw: dict) -> IntentOutput:
@@ -205,7 +193,7 @@ class IntentRouter:
     
     def get_system_prompt(self) -> str:
         return """You are an intent classifier for an snacks & drinks category.
-
+            GOAL: return a json structure
             INTENT TYPES:
             1. recommendation: User wants suggestions ("best", "top", "suggest", "recommend")
             2. comparison: Compare products ("compare", "vs", "difference", "X or Y")
@@ -226,7 +214,7 @@ class IntentRouter:
             - You may include dietary requirements in keywords
             - Example: "low calorie ice cream" or "healthy snacks"
 
-            OUTPUT VALID JSON ONLY:
+            SAMPLE OUTPUT FORMAT:
             {
             "primary_intent": "recommendation",
             "secondary_intents": [],
@@ -245,9 +233,4 @@ class IntentRouter:
             "suggested_keywords": ["low calorie ice cream",],
             "clarification_question": null
             }
-        IMPORTANT:
-            - Output ONLY valid JSON
-            - No markdown
-            - No explanations
-            - No extra text
     """
