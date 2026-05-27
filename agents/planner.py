@@ -1,501 +1,522 @@
-# agents/planner.py
+"""
+agents/planner.py  
+"""
 
+import logging
+import uuid
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
-from schemas.intent import IntentOutput, QueryIntent
 
+logger = logging.getLogger(__name__)
+
+
+# Intent schema  (TypedDict mirror of what HuggingFace model returns)
+
+class QueryIntent(str, Enum):
+    RECOMMENDATION = "recommendation"
+    BUDGET         = "budget"
+    GOAL_BASED     = "goal_based"
+    COMPARISON     = "comparison"
+
+IntentOutput = Dict[str, Any]
+
+
+# Execution plan schema
 
 class ToolName(str, Enum):
-    """Available tools the planner can use"""
-    KEYWORD_SCRAPER = "keyword_scraper"
+    KEYWORD_SCRAPER        = "keyword_scraper"
     PRODUCT_DETAIL_SCRAPER = "product_detail_scraper"
-    PRICE_FILTER = "price_filter"
-    DIETARY_FILTER = "dietary_filter"
-    FLAVOUR_FILTER = "flavour_filter"
-    BRAND_FILTER = "brand_filter"
-    NUTRITION_RANKER = "nutrition_ranker"
-    PRICE_RANKER = "price_ranker"
-    COMPOSITE_RANKER = "composite_ranker"
-    COMPARISON_ENGINE = "comparison_engine"
-    RESPONSE_GENERATOR = "response_generator"
+    PRICE_FILTER           = "price_filter"
+    DIETARY_FILTER         = "dietary_filter"
+    FLAVOUR_FILTER         = "flavour_filter"
+    BRAND_FILTER           = "brand_filter"
+    NUTRITION_RANKER       = "nutrition_ranker"
+    PRICE_RANKER           = "price_ranker"
+    COMPOSITE_RANKER       = "composite_ranker"
+    COMPARISON_ENGINE      = "comparison_engine"
+    RESPONSE_GENERATOR     = "response_generator"
+
 
 class StepStatus(str, Enum):
-    PENDING = "pending"
+    PENDING     = "pending"
     IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    SKIPPED = "skipped"
+    COMPLETED   = "completed"
+    FAILED      = "failed"
+    SKIPPED     = "skipped"
+
 
 class PlanStep(BaseModel):
-    """Single step in the execution plan"""
-    step_id: int
-    tool: ToolName
-    description: str  # Human-readable description of what this step does
-    params: Dict[str, Any] = Field(default_factory=dict)  # Parameters for the tool
-    depends_on: List[int] = Field(default_factory=list)  # Steps that must complete first
-    save_output_as: str  # Variable name to store output
-    retry_on_failure: bool = False
-    max_retries: int = 1
-    fallback_step: Optional[int] = None  # Alternative step if this fails
-    status: StepStatus = StepStatus.PENDING
-    reasoning: str = ""  # Why this step is needed
+    step_id:          int
+    tool:             ToolName
+    description:      str
+    params:           Dict[str, Any]       = Field(default_factory=dict)
+    depends_on:       List[int]            = Field(default_factory=list)
+    save_output_as:   str
+    retry_on_failure: bool                 = False
+    max_retries:      int                  = 1
+    fallback_step:    Optional[int]        = None
+    status:           StepStatus           = StepStatus.PENDING
+    reasoning:        str                  = ""
+
 
 class ExecutionPlan(BaseModel):
-    """Complete execution plan"""
-    plan_id: str
-    query: str
-    intent: IntentOutput
-    steps: List[PlanStep]
-    estimated_time_seconds: float = 0.0
-    total_steps: int = 0
-    requires_scraping: bool = False
-    requires_ranking: bool = False
-    
+    plan_id:           str
+    query:             str
+    intent:            IntentOutput
+    steps:             List[PlanStep]
+    created_at:        str                 = Field(
+                           default_factory=lambda: datetime.now(timezone.utc).isoformat()
+                       )
+    estimated_time_s:  float               = 0.0
+    total_steps:       int                 = 0
+    requires_scraping: bool                = False
+    requires_ranking:  bool                = False
+
     def get_pending_steps(self) -> List[PlanStep]:
-        """Get steps that are ready to execute (dependencies met)"""
-        completed_ids = {
-            step.step_id 
-            for step in self.steps 
-            if step.status == StepStatus.COMPLETED
-        }
-        
-        pending = []
-        for step in self.steps:
-            if step.status == StepStatus.PENDING:
-                # Check if all dependencies are completed
-                if all(dep in completed_ids for dep in step.depends_on):
-                    pending.append(step)
-        return pending
+        """Steps whose dependencies are all completed — safe to execute (possibly in parallel)."""
+        completed_ids = {s.step_id for s in self.steps if s.status == StepStatus.COMPLETED}
+        return [
+            s for s in self.steps
+            if s.status == StepStatus.PENDING
+            and all(dep in completed_ids for dep in s.depends_on)
+        ]
+
+    def get_step(self, step_id: int) -> Optional[PlanStep]:
+        return next((s for s in self.steps if s.step_id == step_id), None)
+
 
 class PlannerAgent:
     """
-    THE BRAIN: Converts intent into an executable plan.
-    
-    This is where the "reasoning" happens:
-    - For recommendation queries → scrape keywords → filter → rank
-    - For comparison queries → scrape specific products → compare
-    - For budget queries → scrape → price filter → rank by value
-    - For goal-based queries → scrape → dietary filter → health rank
-    
-    The Planner understands the available tools and creates optimal
-    execution sequences based on user intent.
+    Converts a raw intent dict (from HuggingFace) into an ExecutionPlan.
+
+    Design decisions
+    ----------------
+    * Intent is always a plain dict — no mixed dict/attr access.
+    * Step IDs are assigned after conditional filtering so depends_on
+      references remain consistent.
+    * Plans are immutable snapshots; 
+    * Low-confidence intents short-circuit to a cheaper plan variant.
     """
-    
-    # Plan templates for different intent types
-    PLAN_TEMPLATES = {
-        QueryIntent.RECOMMENDATION: {
-            "description": "Standard recommendation flow: scrape → filter → rank → respond",
-            "steps": [
-                {
-                    "tool": ToolName.KEYWORD_SCRAPER,
-                    "description": "Scrape products using derived keywords",
-                    "save_as": "scraped_products",
-                    "params_template": {
-                        "keywords": "{{intent.suggested_keywords}}",
-                        "fetch_details": True
-                    }
-                },
-                {
-                    "tool": ToolName.NUTRITION_RANKER,
-                    "description": "Rank products by nutritional value",
-                    "save_as": "ranked_products",
-                    "depends_on": [1],
-                    "params_template": {
-                        "products": "{{scraped_products}}",
-                        "criteria": "balanced"
-                    }
-                },
-                {
-                    "tool": ToolName.RESPONSE_GENERATOR,
-                    "description": "Generate user-friendly response",
-                    "save_as": "final_response",
-                    "depends_on": [2],
-                    "params_template": {}
-                }
-            ]
-        },
-        
-        QueryIntent.BUDGET: {
-            "description": "Budget-constrained flow: scrape → price filter → value ranking",
-            "steps": [
-                {
-                    "tool": ToolName.KEYWORD_SCRAPER,
-                    "description": "Scrape products with price-conscious keywords",
-                    "save_as": "scraped_products",
-                    "params_template": {
-                        "keywords": "{{intent.suggested_keywords}}",
-                        "fetch_details": True
-                    }
-                },
-                {
-                    "tool": ToolName.PRICE_FILTER,
-                    "description": "Filter products within budget",
-                    "save_as": "budget_products",
-                    "depends_on": [1],
-                    "params_template": {
-                        "products": "{{scraped_products}}",
-                        "max_price": "{{intent.entities.max_price}}"
-                    },
-                    "retry_on_failure": True,
-                    "fallback_step": 3  # Skip to ranking if no products in budget
-                },
-                {
-                    "tool": ToolName.COMPOSITE_RANKER,
-                    "description": "Rank by value (price-to-quality ratio)",
-                    "save_as": "ranked_products",
-                    "depends_on": [2],
-                    "params_template": {
-                        "products": "{{budget_products}}",
-                        "criteria": "value_for_money",
-                        "max_price": "{{intent.entities.max_price}}"
-                    }
-                },
-                {
-                    "tool": ToolName.RESPONSE_GENERATOR,
-                    "description": "Generate budget-aware response",
-                    "save_as": "final_response",
-                    "depends_on": [3],
-                    "params_template": {
-                        "include_budget_alternatives": True
-                    }
-                }
-            ]
-        },
-        
-        QueryIntent.GOAL_BASED: {
-            "description": "Health-goal flow: scrape → dietary filter → health ranking",
-            "steps": [
-                {
-                    "tool": ToolName.KEYWORD_SCRAPER,
-                    "description": "Scrape products matching health goal",
-                    "save_as": "scraped_products",
-                    "params_template": {
-                        "keywords": "{{intent.suggested_keywords}}",
-                        "fetch_details": True
-                    }
-                },
-                {
-                    "tool": ToolName.DIETARY_FILTER,
-                    "description": "Filter by dietary constraints (sugar free, low cal, etc.)",
-                    "save_as": "dietary_products",
-                    "depends_on": [1],
-                    "params_template": {
-                        "products": "{{scraped_products}}",
-                        "constraints": "{{intent.entities.dietary_constraints}}"
-                    },
-                    "retry_on_failure": True,
-                    "reasoning": "Must match dietary requirements strictly"
-                },
-                {
-                    "tool": ToolName.FLAVOUR_FILTER,
-                    "description": "Apply flavour preference if specified",
-                    "save_as": "flavour_products",
-                    "depends_on": [2],
-                    "params_template": {
-                        "products": "{{dietary_products}}",
-                        "flavour": "{{intent.entities.flavour}}"
-                    },
-                    "condition": "intent.entities.flavour is not None"
-                },
-                {
-                    "tool": ToolName.NUTRITION_RANKER,
-                    "description": "Rank by health metrics",
-                    "save_as": "ranked_products",
-                    "depends_on": [3],
-                    "params_template": {
-                        "products": "{{flavour_products}}",
-                        "criteria": "{{intent.primary_intent}}",
-                        "dietary_constraints": "{{intent.entities.dietary_constraints}}"
-                    }
-                },
-                {
-                    "tool": ToolName.RESPONSE_GENERATOR,
-                    "description": "Generate health-focused response",
-                    "save_as": "final_response",
-                    "depends_on": [4],
-                    "params_template": {
-                        "include_health_analysis": True
-                    }
-                }
-            ]
-        },
-        
-        QueryIntent.COMPARISON: {
-            "description": "Comparison flow: scrape specific products → compare → respond",
-            "steps": [
-                {
-                    "tool": ToolName.KEYWORD_SCRAPER,
-                    "description": "Search for products to compare",
-                    "save_as": "scraped_products",
-                    "params_template": {
-                        "keywords": "{{intent.suggested_keywords}}",
-                        "fetch_details": True
-                    }
-                },
-                {
-                    "tool": ToolName.BRAND_FILTER,
-                    "description": "Filter to only compared brands",
-                    "save_as": "comparison_products",
-                    "depends_on": [1],
-                    "params_template": {
-                        "products": "{{scraped_products}}",
-                        "brands": "{{intent.entities.comparison_targets}}"
-                    }
-                },
-                {
-                    "tool": ToolName.COMPARISON_ENGINE,
-                    "description": "Generate head-to-head comparison",
-                    "save_as": "comparison_result",
-                    "depends_on": [2],
-                    "params_template": {
-                        "products": "{{comparison_products}}",
-                        "aspects": ["nutrition", "price", "value", "ingredients"]
-                    }
-                },
-                {
-                    "tool": ToolName.RESPONSE_GENERATOR,
-                    "description": "Generate comparison response",
-                    "save_as": "final_response",
-                    "depends_on": [3],
-                    "params_template": {
-                        "format": "comparison_table"
-                    }
-                }
-            ]
-        }
+
+    # Time estimates per tool (seconds) — used for scheduling 
+    _TOOL_TIME: Dict[ToolName, float] = {
+        ToolName.KEYWORD_SCRAPER:        10.0,
+        ToolName.PRODUCT_DETAIL_SCRAPER: 10.0,
+        ToolName.PRICE_FILTER:            1.5,
+        ToolName.DIETARY_FILTER:          1.5,
+        ToolName.FLAVOUR_FILTER:          1.3,
+        ToolName.BRAND_FILTER:            1.3,
+        ToolName.NUTRITION_RANKER:        1.0,
+        ToolName.COMPOSITE_RANKER:        1.0,
+        ToolName.COMPARISON_ENGINE:       2.0,
+        ToolName.RESPONSE_GENERATOR:      2.0,
     }
-    
-    def create_plan(self, query: str, intent: IntentOutput, 
-                    available_tools: Optional[List[ToolName]] = None) -> ExecutionPlan:
+
+    # Plan templates  (logical step definitions, IDs assigned at build time)
+    # Each entry:
+    #   tool            — ToolName
+    #   description     — human-readable
+    #   save_as         — variable name for executor context
+    #   param_paths     — dict of param_key → dotted path into intent
+    #                     (use None value for literal values)
+    #   literal_params  — dict of param_key → literal value
+    #   depends_on_refs — list of save_as strings this step depends on
+    #   condition_path  — dotted intent path; step skipped if value is None
+    #   retry_on_failure
+    #   fallback_ref    — save_as of step to activate on failure (optional)
+    #   reasoning       — override auto-generated reasoning
+
+
+    _TEMPLATES: Dict[str, List[Dict[str, Any]]] = {
+
+        QueryIntent.RECOMMENDATION: [
+            {
+                "tool":            ToolName.KEYWORD_SCRAPER,
+                "description":     "Scrape products using suggested keywords",
+                "save_as":         "scraped_products",
+                "param_paths":     {"keywords": "suggested_keywords"},
+                "literal_params":  {"fetch_details": True},
+                "depends_on_refs": [],
+            },
+            {
+                "tool":            ToolName.NUTRITION_RANKER,
+                "description":     "Rank by nutritional value",
+                "save_as":         "ranked_products",
+                "param_paths":     {},
+                "literal_params":  {"criteria": "balanced"},
+                "depends_on_refs": ["scraped_products"],
+            },
+            {
+                "tool":            ToolName.RESPONSE_GENERATOR,
+                "description":     "Format results for the user",
+                "save_as":         "final_response",
+                "param_paths":     {},
+                "literal_params":  {},
+                "depends_on_refs": ["ranked_products"],
+            },
+        ],
+
+        QueryIntent.BUDGET: [
+            {
+                "tool":            ToolName.KEYWORD_SCRAPER,
+                "description":     "Scrape products with price-aware keywords",
+                "save_as":         "scraped_products",
+                "param_paths":     {"keywords": "suggested_keywords"},
+                "literal_params":  {"fetch_details": True},
+                "depends_on_refs": [],
+            },
+            {
+                "tool":             ToolName.PRICE_FILTER,
+                "description":      "Keep products within budget",
+                "save_as":          "budget_products",
+                "param_paths":      {"max_price": "entities.max_price"},
+                "literal_params":   {},
+                "depends_on_refs":  ["scraped_products"],
+                "retry_on_failure": True,
+                "fallback_ref":     "ranked_products",   # skip filter if it yields zero
+            },
+            {
+                "tool":            ToolName.COMPOSITE_RANKER,
+                "description":     "Rank by value-for-money ratio",
+                "save_as":         "ranked_products",
+                "param_paths":     {"max_price": "entities.max_price"},
+                "literal_params":  {"criteria": "value_for_money"},
+                "depends_on_refs": ["budget_products"],
+            },
+            {
+                "tool":            ToolName.RESPONSE_GENERATOR,
+                "description":     "Format budget-aware results",
+                "save_as":         "final_response",
+                "param_paths":     {},
+                "literal_params":  {"include_budget_alternatives": True},
+                "depends_on_refs": ["ranked_products"],
+            },
+        ],
+
+        QueryIntent.GOAL_BASED: [
+            {
+                "tool":            ToolName.KEYWORD_SCRAPER,
+                "description":     "Scrape products matching health goal",
+                "save_as":         "scraped_products",
+                "param_paths":     {"keywords": "suggested_keywords"},
+                "literal_params":  {"fetch_details": True},
+                "depends_on_refs": [],
+            },
+            {
+                "tool":             ToolName.DIETARY_FILTER,
+                "description":      "Filter by dietary constraints",
+                "save_as":          "dietary_products",
+                "param_paths":      {"constraints": "entities.dietary_constraints"},
+                "literal_params":   {},
+                "depends_on_refs":  ["scraped_products"],
+                "retry_on_failure": True,
+                "reasoning":        "Must match dietary requirements strictly",
+            },
+            {
+                "tool":            ToolName.FLAVOUR_FILTER,
+                "description":     "Apply flavour preference if specified",
+                "save_as":         "flavour_products",
+                "param_paths":     {"flavour": "entities.flavour"},
+                "literal_params":  {},
+                "depends_on_refs": ["dietary_products"],
+                "condition_path":  "entities.flavour",   # skip if None
+            },
+            {
+                "tool":            ToolName.NUTRITION_RANKER,
+                "description":     "Rank by health metrics",
+                "save_as":         "ranked_products",
+                "param_paths":     {
+                                      "criteria":             "primary_intent",
+                                      "dietary_constraints":  "entities.dietary_constraints",
+                                   },
+                "literal_params":  {},
+                # depends on flavour_products if that step ran, else dietary_products
+                "depends_on_refs": ["flavour_products", "dietary_products"],
+                "depends_on_any":  True,   # first available wins
+            },
+            {
+                "tool":            ToolName.RESPONSE_GENERATOR,
+                "description":     "Format health-focused results",
+                "save_as":         "final_response",
+                "param_paths":     {},
+                "literal_params":  {"include_health_analysis": True},
+                "depends_on_refs": ["ranked_products"],
+            },
+        ],
+    }
+
+    def create_plan(
+        self,
+        query:           str,
+        intent:          IntentOutput,
+        available_tools: Optional[List[ToolName]] = None,
+    ) -> ExecutionPlan:
         """
-        Create execution plan based on intent.
-        This is the core reasoning engine.
+        Build an ExecutionPlan from a raw intent dict.
+
+        Raises
+        ------
+        ValueError
+            If any required intent field is missing and the caller should
+            send a clarification back to the user.
         """
-        
-        # Get template for this intent type
-        template = self.PLAN_TEMPLATES.get(intent.primary_intent)
-        
-        if not template:
-            # Fallback to recommendation template
-            template = self.PLAN_TEMPLATES[QueryIntent.RECOMMENDATION]
-        
-        # Build plan steps from template
-        steps = []
-        step_id = 0
-        
-        for step_template in template["steps"]:
-            step_id += 1
-            
-            # Check if this step has a condition
-            condition = step_template.get("condition")
-            if condition and not self._evaluate_condition(condition, intent):
-                continue  # Skip optional steps that don't apply
-            
-            # Resolve parameters
-            resolved_params = self._resolve_params(
-                step_template.get("params_template", {}), 
-                intent
-            )
-            
-            # Determine dependencies
-            depends_on = step_template.get("depends_on", [])
-            
-            # Handle fallback
-            fallback = step_template.get("fallback_step")
-            
-            # Add reasoning
-            reasoning = step_template.get("reasoning", self._generate_reasoning(
-                step_template["tool"], intent, step_id
-            ))
-            
-            step = PlanStep(
-                step_id=step_id,
-                tool=step_template["tool"],
-                description=step_template["description"],
-                params=resolved_params,
-                depends_on=depends_on,
-                save_output_as=step_template["save_as"],
-                retry_on_failure=step_template.get("retry_on_failure", False),
-                max_retries=step_template.get("max_retries", 1),
-                fallback_step=fallback,
-                reasoning=reasoning
-            )
-            
-            # Check tool availability
-            if available_tools and step.tool not in available_tools:
-                step.status = StepStatus.SKIPPED
-                step.reasoning += " (Tool unavailable, skipping)"
-            
-            steps.append(step)
-        
-        # Estimate time
-        estimated_time = self._estimate_execution_time(steps)
-        
-        plan = ExecutionPlan(
-            plan_id=f"plan_{intent.primary_intent.value}_{hash(query) % 10000}",
-            query=query,
-            intent=intent,
-            steps=steps,
-            estimated_time_seconds=estimated_time,
-            total_steps=len(steps),
-            requires_scraping=any(s.tool == ToolName.KEYWORD_SCRAPER for s in steps),
-            requires_ranking=any(s.tool in [ToolName.NUTRITION_RANKER, ToolName.COMPOSITE_RANKER] for s in steps)
+        primary_intent = intent.get("primary_intent", QueryIntent.RECOMMENDATION)
+        confidence     = intent.get("confidence", 1.0)
+
+        template_steps = self._TEMPLATES.get(
+            primary_intent,
+            self._TEMPLATES[QueryIntent.RECOMMENDATION],   # safe fallback
         )
-        
+
+        logger.info(
+            "Building plan",
+            extra={
+                "query":          query,
+                "primary_intent": primary_intent,
+                "confidence":     confidence,
+            },
+        )
+
+        # 1. Filter conditional steps
+        active_templates = self._apply_conditions(template_steps, intent)
+
+        # 2. Assign sequential IDs and build save_as → id map
+        save_as_to_id: Dict[str, int] = {}
+        raw_steps: List[Dict[str, Any]] = []
+
+        for idx, tmpl in enumerate(active_templates, start=1):
+            save_as_to_id[tmpl["save_as"]] = idx
+            raw_steps.append({**tmpl, "_assigned_id": idx})
+
+        # 3. Resolve depends_on references → actual IDs
+        steps: List[PlanStep] = []
+        for tmpl in raw_steps:
+            step_id  = tmpl["_assigned_id"]
+            dep_ids  = self._resolve_dependencies(tmpl, save_as_to_id)
+            params   = self._resolve_params(tmpl, intent)
+            fallback_id = (
+                save_as_to_id.get(tmpl.get("fallback_ref"))
+                if tmpl.get("fallback_ref")
+                else None
+            )
+            reasoning = tmpl.get(
+                "reasoning",
+                self._auto_reasoning(tmpl["tool"], intent, step_id),
+            )
+
+            step = PlanStep(
+                step_id          = step_id,
+                tool             = tmpl["tool"],
+                description      = tmpl["description"],
+                params           = params,
+                depends_on       = dep_ids,
+                save_output_as   = tmpl["save_as"],
+                retry_on_failure = tmpl.get("retry_on_failure", False),
+                max_retries      = tmpl.get("max_retries", 1),
+                fallback_step    = fallback_id,
+                reasoning        = reasoning,
+            )
+
+            if available_tools and step.tool not in available_tools:
+                step.status    = StepStatus.SKIPPED
+                step.reasoning += " [tool unavailable]"
+                logger.warning("Tool unavailable, step skipped", extra={"tool": step.tool})
+
+            steps.append(step)
+
+        # 4. Validate required params are not None
+        self._validate_params(steps, intent)
+
+        # 5. Confidence-based short circuit
+        if confidence < 0.5:
+            steps = self._apply_low_confidence_fallback(steps, intent)
+            logger.warning("Low confidence — applying cheap plan", extra={"confidence": confidence})
+
+        plan = ExecutionPlan(
+            plan_id           = f"plan_{primary_intent}_{uuid.uuid4().hex[:8]}",
+            query             = query,
+            intent            = intent,
+            steps             = steps,
+            estimated_time_s  = self._estimate_time(steps),
+            total_steps       = len(steps),
+            requires_scraping = any(s.tool == ToolName.KEYWORD_SCRAPER for s in steps),
+            requires_ranking  = any(
+                s.tool in (ToolName.NUTRITION_RANKER, ToolName.COMPOSITE_RANKER)
+                for s in steps
+            ),
+        )
+
+        logger.info(
+            "Plan created",
+            extra={
+                "plan_id":           plan.plan_id,
+                "steps":             plan.total_steps,
+                "estimated_time_s":  plan.estimated_time_s,
+            },
+        )
         return plan
-    
-    def _resolve_params(self, template: Dict, intent: IntentOutput) -> Dict:
-        """Resolve template parameters with actual intent values"""
-        resolved = {}
-        
-        for key, value in template.items():
-            if isinstance(value, str) and value.startswith("{{") and value.endswith("}}"):
-                # Template variable - resolve from intent
-                path = value[2:-2].strip()
-                resolved[key] = self._get_nested_value(intent, path)
-            else:
-                resolved[key] = value
-        
+
+    def _apply_conditions(
+        self,
+        templates: List[Dict[str, Any]],
+        intent:    IntentOutput,
+    ) -> List[Dict[str, Any]]:
+        """Remove steps whose condition_path resolves to None in intent."""
+        active = []
+        for tmpl in templates:
+            cond_path = tmpl.get("condition_path")
+            if cond_path is not None:
+                value = self._nested_get(intent, cond_path)
+                if value is None:
+                    logger.debug(
+                        "Skipping step (condition not met)",
+                        extra={"save_as": tmpl["save_as"], "condition_path": cond_path},
+                    )
+                    continue
+            active.append(tmpl)
+        return active
+
+    def _resolve_dependencies(
+        self,
+        tmpl:          Dict[str, Any],
+        save_as_to_id: Dict[str, int],
+    ) -> List[int]:
+        """
+        Resolve depends_on_refs → step IDs.
+        When depends_on_any=True only the first ref that has an ID is used
+        (covers the case where a conditional step may or may not be present).
+        """
+        refs      = tmpl.get("depends_on_refs", [])
+        any_mode  = tmpl.get("depends_on_any", False)
+
+        if any_mode:
+            for ref in refs:
+                if ref in save_as_to_id:
+                    return [save_as_to_id[ref]]
+            return []
+
+        return [save_as_to_id[r] for r in refs if r in save_as_to_id]
+
+    def _resolve_params(
+        self,
+        tmpl:   Dict[str, Any],
+        intent: IntentOutput,
+    ) -> Dict[str, Any]:
+        """
+        Merge param_paths (resolved from intent) with literal_params.
+        param_paths values that resolve to None are included — callers
+        must handle optional params.
+        """
+        resolved: Dict[str, Any] = {}
+
+        for key, path in tmpl.get("param_paths", {}).items():
+            resolved[key] = self._nested_get(intent, path)
+
+        resolved.update(tmpl.get("literal_params", {}))
         return resolved
-    
-    def _get_nested_value(self, obj: Any, path: str) -> Any:
-        """Get nested attribute from object using dot notation"""
-        parts = path.split(".")
+
+    @staticmethod
+    def _nested_get(obj: Any, path: str) -> Any:
+        """Dot-notation accessor for nested dicts."""
         current = obj
-        
-        for part in parts:
-            if hasattr(current, part):
-                current = getattr(current, part)
-            elif isinstance(current, dict):
+        for part in path.split("."):
+            if isinstance(current, dict):
                 current = current.get(part)
             else:
                 return None
-        
+            if current is None:
+                return None
         return current
-    
-    def _evaluate_condition(self, condition: str, intent: IntentOutput) -> bool:
-        """Evaluate a condition string against the intent"""
-        try:
-            # Simple condition evaluator
-            # Supports: "intent.entities.flavour is not None"
-            parts = condition.split(" is ")
-            value = self._get_nested_value(intent, parts[0].strip())
-            
-            if "not None" in parts[1]:
-                return value is not None
-            elif "None" in parts[1]:
-                return value is None
-            
-            return False
-        except:
-            return True  # Default to including step if condition can't be evaluated
-    
-    def _generate_reasoning(self, tool: ToolName, intent: IntentOutput, step_id: int) -> str:
-        """Generate human-readable reasoning for why this step is needed"""
-        reasoning_map = {
-            ToolName.KEYWORD_SCRAPER: f"Need to find products matching '{intent.primary_intent.value}' intent using keywords: {intent.suggested_keywords}",
-            ToolName.PRICE_FILTER: f"User has budget constraint of ₹{intent.entities.max_price} - filtering is essential",
-            ToolName.DIETARY_FILTER: f"User requires specific dietary compliance: {[c.type for c in intent.entities.dietary_constraints]}",
-            ToolName.FLAVOUR_FILTER: f"User specified flavour preference: {intent.entities.flavour}",
-            ToolName.NUTRITION_RANKER: "Ranking by nutritional value aligns with health-conscious query",
-            ToolName.COMPOSITE_RANKER: "Multi-factor ranking needed for balanced recommendation",
-            ToolName.COMPARISON_ENGINE: "Head-to-head comparison required for 'compare' intent",
-            ToolName.RESPONSE_GENERATOR: "Final step: format results as user-friendly response"
+
+    def _validate_params(self, steps: List[PlanStep], intent: IntentOutput) -> None:
+        """
+        Warn when a step receives None for a param that is likely required.
+        Extend this dict to make validation strict (raise ValueError) for prod.
+        """
+        required_by_tool: Dict[ToolName, List[str]] = {
+            ToolName.PRICE_FILTER:    ["max_price"],
+            ToolName.DIETARY_FILTER:  ["constraints"],
+            ToolName.KEYWORD_SCRAPER: ["keywords"],
         }
-        return reasoning_map.get(tool, f"Step {step_id}: {tool.value}")
-    
-    def _estimate_execution_time(self, steps: List[PlanStep]) -> float:
-        """Estimate total execution time"""
-        time_estimates = {
-            ToolName.KEYWORD_SCRAPER: 15.0,  # Scraping takes longest
-            ToolName.PRODUCT_DETAIL_SCRAPER: 10.0,
-            ToolName.PRICE_FILTER: 0.5,
-            ToolName.DIETARY_FILTER: 0.5,
-            ToolName.FLAVOUR_FILTER: 0.3,
-            ToolName.BRAND_FILTER: 0.3,
-            ToolName.NUTRITION_RANKER: 1.0,
-            ToolName.COMPOSITE_RANKER: 1.0,
-            ToolName.COMPARISON_ENGINE: 2.0,
-            ToolName.RESPONSE_GENERATOR: 2.0,
-        }
-        
-        # Account for parallel execution (steps without dependencies can run in parallel)
-        sequential_time = sum(time_estimates.get(s.tool, 1.0) for s in steps)
-        
-        # Simple parallel estimation: if no dependencies, can run in parallel
-        parallel_groups = {}
         for step in steps:
-            if not step.depends_on:
-                group = 0
-            else:
-                group = max(step.depends_on)
-            if group not in parallel_groups:
-                parallel_groups[group] = []
-            parallel_groups[group].append(step)
-        
-        # Max time per group
-        parallel_time = sum(
-            max(time_estimates.get(s.tool, 1.0) for s in group_steps)
-            for group_steps in parallel_groups.values()
-        )
-        
-        return min(sequential_time, parallel_time)  # Best case with parallelization
-    
-    def adapt_plan(self, plan: ExecutionPlan, step_id: int, 
-                   error: str, context: Dict[str, Any]) -> ExecutionPlan:
+            if step.status == StepStatus.SKIPPED:
+                continue
+            for required_param in required_by_tool.get(step.tool, []):
+                if step.params.get(required_param) is None:
+                    logger.warning(
+                        "Required param is None — step may fail",
+                        extra={
+                            "step_id": step.step_id,
+                            "tool":    step.tool,
+                            "param":   required_param,
+                        },
+                    )
+
+    def _apply_low_confidence_fallback(
+        self,
+        steps:  List[PlanStep],
+        intent: IntentOutput,
+    ) -> List[PlanStep]:
         """
-        Adapt the plan when a step fails.
-        This is where the planner gets "smart" - it can change strategy.
+        On low confidence: skip scraping and go straight to response,
+        asking the user for clarification. Extend this for a cached-result path.
         """
-        
-        # Find the failed step
-        for step in plan.steps:
-            if step.step_id == step_id:
-                step.status = StepStatus.FAILED
-                
-                # Check if we have a fallback
-                if step.fallback_step:
-                    print(f"Step {step_id} failed, using fallback step {step.fallback_step}")
-                    # Activate fallback step
-                    for s in plan.steps:
-                        if s.step_id == step.fallback_step:
-                            s.status = StepStatus.PENDING
-                            # Remove dependency on failed step
-                            s.depends_on = [d for d in s.depends_on if d != step_id]
-                            if not s.depends_on:
-                                # If no dependencies left, execute immediately
-                                s.reasoning += f" (Activated as fallback for failed step {step_id})"
-                
-                # If keyword scraper failed with no results, try broader keywords
-                if step.tool == ToolName.KEYWORD_SCRAPER and step.retry_on_failure:
-                    if step.max_retries > 0:
-                        print(f" Retrying step {step_id} with broader keywords...")
-                        # Broaden the keywords
-                        original_keywords = step.params.get("keywords", [])
-                        broader_keywords = self._broaden_keywords(original_keywords)
-                        step.params["keywords"] = broader_keywords
-                        step.max_retries -= 1
-                        step.status = StepStatus.PENDING
-                        step.reasoning += f" | Retrying with broader keywords: {broader_keywords}"
-                
-                break
-        
-        return plan
-    
-    def _broaden_keywords(self, keywords: List[str]) -> List[str]:
-        """Broaden search keywords when initial search fails"""
-        broader = []
-        for kw in keywords:
-            # Remove specific constraints
-            broader_kw = kw.replace("sugar free ", "").replace("low calorie ", "")
-            broader_kw = broader_kw.replace("vanilla ", "").replace("chocolate ", "")
-            
-            # If too short, use generic
-            if len(broader_kw.split()) < 2:
-                broader_kw = "ice cream"
-            
-            broader.append(broader_kw.strip())
-        
-        return list(set(broader))  # Deduplicate
+        clarification_q = intent.get("clarification_question")
+        for step in steps:
+            if step.tool not in (ToolName.RESPONSE_GENERATOR,):
+                step.status    = StepStatus.SKIPPED
+                step.reasoning += " [skipped: low confidence]"
+
+        # Inject clarification param into response generator
+        for step in steps:
+            if step.tool == ToolName.RESPONSE_GENERATOR:
+                step.depends_on              = []
+                step.params["clarification"] = clarification_q or (
+                    "Could you clarify what you're looking for?"
+                )
+        return steps
+
+    def _estimate_time(self, steps: List[PlanStep]) -> float:
+        """
+        Estimate wall-clock time accounting for parallel execution.
+        Builds a simple DAG cost model: each "wave" of dependency-free steps
+        runs in parallel; cost = max(tool_times) per wave.
+        """
+        remaining     = [s for s in steps if s.status != StepStatus.SKIPPED]
+        completed_ids: set = set()
+        total_time    = 0.0
+
+        while remaining:
+            # Steps whose deps are all satisfied
+            wave = [
+                s for s in remaining
+                if all(dep in completed_ids for dep in s.depends_on)
+            ]
+            if not wave:
+                break  
+
+            wave_time  = max(self._TOOL_TIME.get(s.tool, 1.0) for s in wave)
+            total_time += wave_time
+            for s in wave:
+                completed_ids.add(s.step_id)
+            remaining = [s for s in remaining if s not in wave]
+
+        return total_time
+
+    def _auto_reasoning(self, tool: ToolName, intent: IntentOutput, step_id: int) -> str:
+        entities = intent.get("entities", {})
+        msgs: Dict[ToolName, str] = {
+            ToolName.KEYWORD_SCRAPER:    f"Find products for '{intent.get('primary_intent')}' "
+                                         f"using: {intent.get('suggested_keywords', [])}",
+            ToolName.PRICE_FILTER:       f"Budget constraint ₹{entities.get('max_price')} — must filter",
+            ToolName.DIETARY_FILTER:     f"Dietary requirements: {entities.get('dietary_constraints')}",
+            ToolName.FLAVOUR_FILTER:     f"Flavour preference: {entities.get('flavour')}",
+            ToolName.NUTRITION_RANKER:   "Rank by nutritional value — aligns with health query",
+            ToolName.COMPOSITE_RANKER:   "Multi-factor ranking for value recommendation",
+            ToolName.COMPARISON_ENGINE:  "Head-to-head comparison for 'compare' intent",
+            ToolName.RESPONSE_GENERATOR: "Final step — format results for user",
+        }
+        return msgs.get(tool, f"Step {step_id}: {tool.value}")
