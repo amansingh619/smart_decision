@@ -63,7 +63,7 @@ class RankerTool:
         all_calories = [p.nutrition.calories_per_100g for p in [product] if p.nutrition and p.nutrition.calories_per_100g]
         all_proteins = [p.nutrition.protein_per_100g for p in [product] if p.nutrition and p.nutrition.protein_per_100g]
         
-        if intent.primary_intent == QueryIntent.BUDGET:
+        if intent["primary_intent"] == QueryIntent.BUDGET:
             # Prioritize price and value
             if intent.entities.max_price:
                 # Score price (lower is better)
@@ -88,7 +88,7 @@ class RankerTool:
                 total_score += protein_score * 0.3
                 total_weight += 0.3
         
-        elif intent.primary_intent == QueryIntent.GOAL_BASED:
+        elif intent["primary_intent"] == QueryIntent.GOAL_BASED:
             # Check if diabetic friendly or weight loss
             constraints = [c.type for c in intent.entities.dietary_constraints]
             
