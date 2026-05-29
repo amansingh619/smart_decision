@@ -8,6 +8,7 @@ from typing import Dict, Any, List
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from agents.planner import ExecutionPlan, StepStatus, ToolName
+from agents.response_generator import ResponseGenerator
 from tools.scraper_tool import ScraperTool
 from tools.filter_tool import FilterTool
 from tools.ranker_tool import RankerTool
@@ -25,6 +26,7 @@ class ExecutorAgent:
             ToolName.RESPONSE_GENERATOR: self._execute_response_generator,
         }
         self.scraper_tool = ScraperTool(spider_instance, logger)
+        self.response_generator = ResponseGenerator(logger=logger)
         self.filter_tool  = FilterTool()
         self.ranker_tool  = RankerTool()
         self.logger = logger
@@ -278,7 +280,7 @@ class ExecutorAgent:
         self.logger.info(f"     Ranked {len(ranked)} products (composite)")
         return ranked
 
-    def _execute_response_generator(self, params: dict):
+    def _execute_response_generator(self, params= {}):
         """Format the final ranked list into a user-facing response."""
         ranked_products = self.context.get("ranked_products", [])
         intent          = self.context["intent"]
@@ -297,5 +299,4 @@ class ExecutorAgent:
             )
 
         response = self.response_generator.generate(ranked_products, intent, query)
-        self.logger.info("     Response generated")
         return response

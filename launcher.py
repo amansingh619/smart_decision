@@ -59,10 +59,3 @@ if __name__ == "__main__":
         print(f"{'#'*60}")
         
         result = pipeline.launch_job(query)
-        
-        # Save results
-        products_data = [rp.product.dict() for rp in result.ranked_products]
-        df = pd.DataFrame(products_data)
-        safe_query = query.replace(" ", "_")[:50]
-        df.to_excel(f"results_{safe_query}.xlsx", index=False)
-        print(f"\nResults saved to results_{safe_query}.xlsx")
